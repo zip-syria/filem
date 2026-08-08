@@ -1,0 +1,66 @@
+name: Process Large Video Upload
+
+on:
+  repository_dispatch:
+    types: [process_large_upload]
+
+permissions:
+  contents: write # مطلوب لرفع الملف إلى الإصدار
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract Variables
+        run: |
+          echo "SESSION_ID=${{ github.event.client_payload.sessionId }}" >> $GITHUB_ENV
+          echo "FILE_NAME=${{ github.event.client_payload.fileName }}" >> $GITHUB_ENV
+          echo "ENCODED_NAME=${{ github.event.client_payload.encodedFileName }}" >> $GITHUB_ENV
+          echo "RELEASE_ID=${{ github.event.client_payload.releaseId }}" >> $GITHUB_ENV
+          echo "CONTENT_TYPE=${{ github.event.client_payload.contentType }}" >> $GITHUB_ENV
+
+      - name: Download File from Cloudflare Worker
+        run: |
+          echo "جاري تحميل الملف من الووركر..."
+          curl -f -L -H "X-Api-Key: ${{ secrets.WORKER_API_KEY }}" \
+               -o "$FILE_NAME" \
+               "${{ secrets.WORKER_BASE_URL }}/upload/download/$SESSION_ID"
+
+      - name: Upload to GitHub Release
+        id: upload_release
+        run: |
+          echo "جاري رفع الملف إلى الإصدار..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+               -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+               -H "Content-Type: $CONTENT_TYPE" \
+               --data-binary @"$FILE_NAME" \
+               "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=$ENCODED_NAME")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            ASSET_URL=$(echo "$BODY" | jq -r '.browser_download_url')
+            echo "ASSET_URL=$ASSET_URL" >> $GITHUB_ENV
+            echo "تم الرفع بنجاح: $ASSET_URL"
+          else
+            echo "فشل رفع الملف إلى GitHub (HTTP $HTTP_CODE)"
+            echo "$BODY"
+            exit 1
+          fi
+
+      - name: Cleanup Cloudflare R2
+        if: always() # يعمل حتى لو فشلت الخطوة السابقة لتفادي تراكم الملفات
+        run: |
+          echo "جاري تنظيف المساحة..."
+          if [ "${{ steps.upload_release.outcome }}" = "success" ]; then
+            curl -X POST \
+                 -H "X-Api-Key: ${{ secrets.WORKER_API_KEY }}" \
+                 -H "Content-Type: application/json" \
+                 -d "{\"sessionId\":\"$SESSION_ID\",\"success\":true,\"githubAssetUrl\":\"$ASSET_URL\"}" \
+                 "${{ secrets.WORKER_BASE_URL }}/upload/cleanup"
+          else
+            curl -X POST \
+                 -H "X-Api-Key: ${{ secrets.WORKER_API_KEY }}" \
+                 -H "Content-Type: application/json" \
+                 -d "{\"sessionId\":\"$SESSION_ID\",\"success\":false,\"errorMessage\":\"فشل رفع الملف إلى GitHub Release (راجع سجل الأكشن)\"}" \
+                 "${{ secrets.WORKER_BASE_URL }}/upload/cleanup"
+          fi
